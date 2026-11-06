@@ -1,7 +1,9 @@
 """Ajustes: inicio de sesión con GitHub usando GitHub CLI (`gh`)."""
 
+import os
 import re
 import shutil
+import sys
 
 from PyQt6.QtCore import QProcess, QProcessEnvironment, Qt, QTimer, QUrl, pyqtSignal
 from PyQt6.QtGui import QDesktopServices, QGuiApplication
@@ -19,6 +21,33 @@ from PyQt6.QtWidgets import (
 HOST = "github.com"
 DEVICE_URL = "https://github.com/login/device"
 CODE_RE = re.compile(r"\b([A-Z0-9]{4}-[A-Z0-9]{4})\b")
+
+IS_WINDOWS = sys.platform.startswith("win")
+
+# Instalación oficial de GitHub CLI en Windows (winget viene incluido en Windows 10/11 recientes).
+WINGET_ARGS = [
+    "install", "--id", "GitHub.cli", "-e", "--source", "winget",
+    "--silent", "--accept-package-agreements", "--accept-source-agreements",
+]
+
+
+def find_gh() -> str:
+    """Ruta de gh, o "" si no está. En Windows también mira las carpetas de instalación
+    habituales, así se detecta justo después de instalarlo sin reiniciar la app."""
+    found = shutil.which("gh")
+    if found:
+        return found
+    if IS_WINDOWS:
+        roots = [os.environ.get("ProgramFiles"), os.environ.get("ProgramFiles(x86)")]
+        local = os.environ.get("LocalAppData")
+        if local:
+            roots.append(os.path.join(local, "Programs"))
+        for root in roots:
+            if root:
+                candidate = os.path.join(root, "GitHub CLI", "gh.exe")
+                if os.path.isfile(candidate):
+                    return candidate
+    return ""
 
 # Instalación oficial de GitHub CLI para Debian/Ubuntu/Mint (se ejecuta como root con pkexec).
 INSTALL_GH_SCRIPT = r"""
@@ -189,7 +218,7 @@ class SettingsPage(QWidget):
         proc.readyReadStandardOutput.connect(read_output)
         proc.finished.connect(finished)
         proc.errorOccurred.connect(errored)
-        proc.start(program or shutil.which("gh") or "gh", list(args))
+        proc.start(program or find_gh() or "gh", list(args))
         if stdin is not None:
             proc.write(stdin.encode())
         proc.closeWriteChannel()
@@ -210,24 +239,25 @@ class SettingsPage(QWidget):
     # ---------- instalación automática de gh ----------
     @staticmethod
     def _can_auto_install() -> bool:
-        return bool(shutil.which("apt-get") and shutil.which("pkexec"))
+        return bool(shutil.which("winget")) if IS_WINDOWS else bool(shutil.which("apt-get") and shutil.which("pkexec"))
 
     def _offer_install(self) -> None:
         """Una sola vez por ejecución: pregunta si quiere instalar gh ahora."""
-        if self._install_offered or shutil.which("gh") or not self._can_auto_install():
+        if self._install_offered or find_gh() or not self._can_auto_install():
             return
         self._install_offered = True
         answer = QMessageBox.question(
             self,
             "Instalar GitHub CLI",
             "GitCraft usa GitHub CLI (gh) para iniciar sesión y conectarse a GitHub, "
-            "y no está instalado.\n\n¿Instalarlo ahora? Te pedirá tu contraseña de administrador.",
+            "y no está instalado.\n\n¿Instalarlo ahora? "
+            + ("Windows puede pedirte confirmar con permisos de administrador." if IS_WINDOWS else "Te pedirá tu contraseña de administrador."),
         )
         if answer == QMessageBox.StandardButton.Yes:
             self._install_gh()
 
     def _install_gh(self) -> None:
-        if shutil.which("gh") or self._busy:
+        if find_gh() or self._busy:
             return
         if not self._can_auto_install():
             self.message.setText(
@@ -235,11 +265,15 @@ class SettingsPage(QWidget):
                 "Instálalo desde https://cli.github.com y reinicia la app."
             )
             return
+        if IS_WINDOWS:
+            self.message.setText("Instalando GitHub CLI con winget... puede tardar un minuto. Si Windows pide permiso, acéptalo.")
+            self._run(WINGET_ARGS, self._install_done, program=shutil.which("winget"))
+            return
         self.message.setText("Instalando GitHub CLI... puede tardar un minuto. Escribe tu contraseña cuando la pida.")
         self._run(["sh", "-c", INSTALL_GH_SCRIPT], self._install_done, program="pkexec")
 
     def _install_done(self, ok: bool, out: str) -> None:
-        if ok and shutil.which("gh"):
+        if find_gh():
             self.message.setText("GitHub CLI instalado. Ya puedes iniciar sesión.")
             self.refresh_session()
         elif not ok and ("dismissed" in out.lower() or "not authorized" in out.lower()):
@@ -249,7 +283,7 @@ class SettingsPage(QWidget):
 
     # ---------- sesión ----------
     def refresh_session(self) -> None:
-        if not shutil.which("gh"):
+        if not find_gh():
             self._set_user("")
             QTimer.singleShot(400, self._offer_install)
             return
@@ -341,7 +375,7 @@ class SettingsPage(QWidget):
 
     # ---------- interfaz ----------
     def _render(self) -> None:
-        has_gh = bool(shutil.which("gh"))
+        has_gh = bool(find_gh())
         logging_in = self._login_proc is not None
         idle = self._busy == 0 and not logging_in
 
